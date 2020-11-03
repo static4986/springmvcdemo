@@ -1,7 +1,10 @@
 package mvnFramework.context;
 
+import mvnFramework.annotation.AutoWiredOther;
 import mvnFramework.annotation.ControllerOther;
+import mvnFramework.annotation.RequestMappingOther;
 import mvnFramework.annotation.ServiceOther;
+import mvnFramework.support.Handler;
 import org.apache.commons.lang3.StringUtils;
 
 import javax.servlet.ServletConfig;
@@ -12,11 +15,15 @@ import javax.servlet.http.HttpServletResponse;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Parameter;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 public class DispatcherServletOther extends HttpServlet {
 
@@ -29,6 +36,9 @@ public class DispatcherServletOther extends HttpServlet {
 
     //ico容器
     private Map<String, Object> iocMap = new HashMap<>();
+
+    //处理器映射器容器
+    private Map<String, Handler> handlerMap = new HashMap<>();
 
     @Override
     public void init(ServletConfig config) throws ServletException {
@@ -54,13 +64,73 @@ public class DispatcherServletOther extends HttpServlet {
         super.init(config);
     }
 
+    /**
+     * 配置处理器映射器
+     */
     private void doHandlerResolver() {
+        if (iocMap.isEmpty()) return;
+
+        for (Map.Entry<String, Object> map : iocMap.entrySet()) {
+            //过滤被@RequestMappintOther注解修饰的方法
+            Class<?> aClass = map.getValue().getClass();
+            if (aClass.isAnnotationPresent(RequestMappingOther.class)) {
+                RequestMappingOther annotation = aClass.getAnnotation(RequestMappingOther.class);
+                //获取类上的路径
+                String basePath = annotation.value();
+                Method[] methods = aClass.getDeclaredMethods();
+
+                //过滤被@RequestMappingOther注解修饰的方法
+                for (Method method : methods) {
+                    if (method.isAnnotationPresent(RequestMappingOther.class)) {
+                        RequestMappingOther methodAnnotation = method.getAnnotation(RequestMappingOther.class);
+                        String methodPath = methodAnnotation.value();
+                        //url全路径
+                        String fullPath = basePath + methodPath;
+                        Handler handler = new Handler(map.getValue(), method, Pattern.compile(fullPath));
+                        //设置方法参数
+                        Parameter[] parameters = method.getParameters();
+                        for (int i = 0; i < parameters.length; i++) {
+                            Parameter parameter = parameters[i];
+                            //判断请求的参数类型HttpServletRequest req, HttpServletResponse resp
+                            if (parameter.getType() == HttpServletRequest.class || parameter.getType() == HttpServletResponse.class){
+                                handler.getParamList().put(parameter.getType().getSimpleName(),i);
+                            }else {
+                                //请求参数是一般类型,String
+                                handler.getParamList().put(parameter.getName(),i);
+                            }
+                            handlerMap.put(fullPath,handler);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /**
      * 依赖注入
      */
     private void doAssembleDependence() {
+        if (iocMap.isEmpty()) return;
+
+        //解析对象，获取被@AutoWired修饰的属性
+        for (Map.Entry<String, Object> entry : iocMap.entrySet()) {
+            Field[] declaredFields = entry.getValue().getClass().getDeclaredFields();
+            for (Field field : declaredFields) {
+                //被@AutoWiredOther注解修饰的属性
+                if (field.isAnnotationPresent(AutoWiredOther.class)) {
+                    field.setAccessible(true);
+                    Object singleton = iocMap.get(field.getType().getSimpleName());
+                    if (null != singleton) {
+                        try {
+                            //成员变量属性注入
+                            field.set(entry.getValue(), singleton);
+                        } catch (IllegalAccessException e) {
+                            e.printStackTrace();
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -76,21 +146,21 @@ public class DispatcherServletOther extends HttpServlet {
                     if (aClass.isAnnotationPresent(ControllerOther.class)) {
                         String simpleName = aClass.getSimpleName();
                         String firstLowString = firstLow(simpleName);
-                        iocMap.put(firstLowString,singleton);
-                    }else if(aClass.isAnnotationPresent(ServiceOther.class)){
+                        iocMap.put(firstLowString, singleton);
+                    } else if (aClass.isAnnotationPresent(ServiceOther.class)) {
                         //判断注解是否有value值
                         ServiceOther serviceOther = aClass.getAnnotation(ServiceOther.class);
                         String alias = serviceOther.value();
-                        if(StringUtils.isNotBlank(alias)){
-                            iocMap.put(alias,singleton);
-                        }else {
-                            iocMap.put(firstLow(aClass.getSimpleName()),singleton);
+                        if (StringUtils.isNotBlank(alias)) {
+                            iocMap.put(alias, singleton);
+                        } else {
+                            iocMap.put(firstLow(aClass.getSimpleName()), singleton);
                         }
                         //实现的所有接口，实例化放入容器
                         Class<?>[] interfaces = aClass.getInterfaces();
-                        for (Class<?> interfaceName : interfaces){
+                        for (Class<?> interfaceName : interfaces) {
                             String parentName = firstLow(interfaceName.getSimpleName());
-                            iocMap.put(parentName,singleton);
+                            iocMap.put(parentName, singleton);
                         }
                     }
                 } catch (InstantiationException e) {
@@ -110,7 +180,7 @@ public class DispatcherServletOther extends HttpServlet {
 
     /**
      * 首字母转换小写
-     * */
+     */
     private String firstLow(String simpleName) {
         char[] chars = simpleName.toCharArray();
         if (chars[0] >= 'A' && chars[0] <= 'Z') {
@@ -171,7 +241,18 @@ public class DispatcherServletOther extends HttpServlet {
 
     @Override
     protected void doPost(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
-        super.doPost(req, resp);
+        //根据请求的url获取处理器
+        String requestURI = req.getRequestURI();
+        Handler handler = handlerMap.get(requestURI);
+        try {
+            Object invoke = handler.getMethod().invoke(handler.getObject());
+        } catch (IllegalAccessException e) {
+            e.printStackTrace();
+        } catch (InvocationTargetException e) {
+            e.printStackTrace();
+        }
+
+
     }
 
 
